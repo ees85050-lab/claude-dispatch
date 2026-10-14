@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# claude-dispatch — run a Claude Code task unattended, detached from your terminal.
+#
+# Hands a task spec (a markdown file) to a `claude -p` process owned by `systemd-run --user`, so it keeps
+# running when the terminal, the editor or the laptop goes away. README.md tells the story; this header is
+# the reference for whoever changes the code.
+#
+# Outcomes. Every exit path of --run appends exactly one marker line to the run's log:
+#   [dispatch:end] <name> <outcome> rc=<rc> <YYYY-mm-dd HH:MM:SS>
+# Other tools (--after, --last, your own scripts) grep only this line. The list lives here:
+#   done           claude rc=0 and the ledger ends with DONE (or the spec names no ledger)
+#   stopped        claude rc=0 and the ledger ends with "STOPPED: <reason>"
+#   incomplete     rc=0, but after DISPATCH_MAX_RESUMES in-place resumes the ledger still has no ending   (look)
+#   failed         claude rc≠0, not a usage limit, not a signal                                          (look)
+#   killed         claude died from a signal (rc>128) or this runner got TERM; systemd restarts it 2 min
+#                  later, twice — the third kill within 3 h is final
+#   paused         the in-run gate saw the 5-hour window over the line; a resume is scheduled after the reset
+#   rate-limited   claude hit the usage limit; a retry is scheduled after the reset (3 tries in all)
+#   held           the start gate saw the window over the line; a start is scheduled after the reset (4 holds max)
+#   low-memory     MemAvailable stayed under DISPATCH_MEM_MIN_MB for 30 min (checked every 5); exit 75, no restart
+#   prereq-failed  an --after prerequisite ended without done/stopped, or ran past DISPATCH_AFTER_MAX_H
+# When scheduling a resume/retry/hold fails, the outcome stays the same and the line above it in the log
+# has the command to run by hand. An OOM SIGKILL of this runner can't write a marker: "unit gone, no marker"
+# means exactly that.
+#
+# Why the pieces exist (each one is a failure that happened):
+# - `claude -p` exits when its turn ends and takes background jobs with it, still with rc=0. The prompt is
+#   prefixed with rules (wait in the foreground, end only after writing DONE/STOPPED), and a run that exits
+#   0 without an ending in its ledger is resumed in place with a note saying so.
+# - A run OOM-killed in its first minute was never retried: the unit restarts on failure, and memory is
+#   checked before starting. systemd may not set $RESTART_COUNT, so starts are counted in $STATE/<name>.starts:
+#   written at start, removed at a normal end; still there at start = the previous start was killed.
+# - One unattended run ate the whole 5-hour window and the interactive session sat locked out. The start gate
+#   holds at DISPATCH_START_MAX, the in-run gate pauses at DISPATCH_PAUSE_AT (SIGTERM, resume after the reset;
+#   the ledger makes resuming cheap). A gate that can't read the quota 3 times in a row lets the run continue
+#   and notifies. $STATE/gate.override holds "<percent> <expiry epoch>" to raise both lines until it expires.
+# - A hand-started run and a scheduled retry started in the same second: a name that is running or has a
+#   retry/pause/hold scheduled can't be dispatched again.
+# - Each claude start gets a fresh --session-id, logged as sid=…; when it exits, run-cost appends a line with
+#   tokens and list-price cost per model.
+set -uo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HERE="$(dirname "$SELF")"
+LIB="${DISPATCH_LIB:-$HERE/../lib}"
+RUN_COST="${DISPATCH_RUN_COST:-$HERE/run-cost}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/claude-dispatch"
+LOGDIR="${DISPATCH_LOGDIR:-$STATE_HOME/logs}"
+STATE="${DISPATCH_STATE:-$STATE_HOME/state}"
+LIMIT_RE="usage limit|session limit|weekly limit|rate limit|hit your limit"
+PERM_DEFAULT="--dangerously-skip-permissions"   # nobody is there to click "allow"; see README before using it
+MEM_MIN_MB="${DISPATCH_MEM_MIN_MB:-1000}"; MEM_WAITS=6; MEM_WAIT_S=300
+START_MAX="${DISPATCH_START_MAX:-70}"; PAUSE_AT="${DISPATCH_PAUSE_AT:-80}"; POLL="${DISPATCH_POLL_SEC:-300}"; MAX_HOLDS=4
+OVERRIDE="$STATE/gate.override"
+
+usage() {
+  cat <<'EOF'
+claude-dispatch — run a Claude Code task unattended under systemd-run --user
+
+  claude-dispatch <name> <spec.md>                        dispatch now (unit dispatch-<name>)
+  claude-dispatch --after <a>[,<b>...] <name> <spec.md>   dispatch now; the unit waits until a, b... are done or stopped
+  claude-dispatch --dry-run [--after ...] <name> <spec.md> print the systemd-run command, start nothing
+  claude-dispatch --list                                  dispatch units running or scheduled
+  claude-dispatch --last <name>                           latest end marker of <name> (exit 1 if there is none)
+  claude-dispatch --run <name> <spec.md> <try>            internal: what the unit runs
+
+Names: letters, digits and dashes. Logs: $DISPATCH_LOGDIR, default ~/.local/state/claude-dispatch/logs.
+Settings are environment variables, read when you dispatch; see README.md.
+EOF
+}
+
+mem_avail() { free -m | awk '/^Mem:/ {print $7}'; }
+eff() {   # $1 = default line; a gate.override that hasn't expired replaces it
+  local v u; read -r v u < "$OVERRIDE" 2>/dev/null || { echo "$1"; return; }
+  if [ -n "${u:-}" ] && [ "$(date +%s)" -lt "$u" ] 2>/dev/null; then echo "$v"; else echo "$1"; fi
+}
+reset_plus3() {   # reset time + 3 minutes; unparseable or past → now + 5 hours
+  local t; t=$(date -d "${1%(*}" +%s 2>/dev/null) || t=""
+  if [ -n "$t" ] && [ "$t" -gt "$(date +%s)" ]; then date -d "@$((t+180))" '+%F %T'; else date -d "+5 hours" '+%F %T'; fi
+}
+alive() {   # $1 = name: its unit is running, or a retry/pause/hold for it is scheduled
+  systemctl --user list-units --all --no-legend "dispatch-$1.service" "dispatch-$1-retry*" "dispatch-$1-pause*" "dispatch-$1-hold*" 2>/dev/null \
+    | grep -qE 'active|activating|waiting'
+}
+last_end_line() {   # $1 = name: the last marker across all its logs (a resume after midnight writes a new day's file)
+  local f; f=$(ls "$LOGDIR"/????-??-??-"$1".log 2>/dev/null | sort)
+  [ -n "$f" ] || return 0
+  # shellcheck disable=SC2086
+  grep -h "^\[dispatch:end\] $1 " $f 2>/dev/null | tail -1
+}
+last_end() { last_end_line "$1" | awk '{print $3}'; }
+new_sid() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
+forward_env() {   # a unit sees only what it is given: PATH plus every exported DISPATCH_/QUOTA_/RUN_COST_ setting
+  local v                # (never secrets: those go in DISPATCH_ENV_FILE, which systemd reads itself)
+  FWD=(--setenv=PATH="$PATH")
+  for v in $(compgen -e | grep -E '^(DISPATCH_|QUOTA_|RUN_COST_)|^(CLAUDE_CONFIG_DIR|XDG_STATE_HOME)$'); do
+    FWD+=(--setenv="$v=${!v}")
+  done
+}
+unit_props() {   # shared by the dispatched unit and every retry/pause/hold unit: killed → restart, 75 → no restart
+  UNIT_PROPS=(-p WorkingDirectory="$DISPATCH_WORKDIR"
+    -p Restart=on-failure -p RestartSec=120 -p StartLimitBurst=3 -p StartLimitIntervalSec=3h -p RestartPreventExitStatus=75)
+  [ -n "${DISPATCH_ENV_FILE:-}" ] && UNIT_PROPS+=(-p EnvironmentFile="$DISPATCH_ENV_FILE")
+  return 0
+}
+schedule_run() {   # $1 = when, $2 = unit suffix, $3 = try number (default: this one): same name, same spec
+  unit_props; forward_env
+  systemd-run --user --on-calendar="$1" --unit="dispatch-$NAME-$2" --collect "${UNIT_PROPS[@]}" \
+    "${FWD[@]}" "$SELF" --run "$NAME" "$SPEC" "${3:-$TRY}" >/dev/null 2>&1
+}
+log() { echo "[dispatch] $(date '+%F %T') $*" >> "$LOG"; }
+by_hand() { printf 'By hand: cd %q && %q %q %q' "$DISPATCH_WORKDIR" "$SELF" "$NAME" "$SPEC"; }
+notify() {   # DISPATCH_NOTIFY is a command line; the message goes in as one more argument
+  [ -n "${DISPATCH_NOTIFY:-}" ] || return 0
+  local o
+  o=$(timeout 30 bash -c "$DISPATCH_NOTIFY \"\$1\"" notify "$1" 2>&1 < /dev/null) \
+    || log "notify failed: $(printf '%s' "$o" | tr '\n' ' ' | cut -c1-200)"
+}
+wrapup() {   # $1 = outcome. DISPATCH_WRAPUP runs after done/stopped; its result is logged, never changes the outcome
+  [ -n "${DISPATCH_WRAPUP:-}" ] || return 0
+  local o r
+  o=$(DISPATCH_NAME="$NAME" DISPATCH_LOG="$LOG" DISPATCH_LEDGER="$LEDGER" DISPATCH_OUTCOME="$1" \
+      timeout 300 bash -c "$DISPATCH_WRAPUP" 2>&1 < /dev/null); r=$?
+  log "wrapup rc=$r: $(printf '%s' "$o" | tr '\n' ' ' | cut -c1-500)"
+}
+END_DONE=""
+end() {   # $1 = outcome (list in the header), $2 = rc: writes the marker line, once per --run
+  [ -n "$END_DONE" ] && return 0; END_DONE=1
+  echo "[dispatch:end] $NAME $1 rc=$2 $(date '+%F %T')" >> "$LOG"
+  notify "dispatch $NAME: $1 (rc=$2) · log $LOG"
+}
+
+case "${1:-}" in
+  --list)
+    systemctl --user list-units --no-legend 'dispatch-*' 2>/dev/null || true; exit 0;;
+  --last)
+    [[ "${2:-}" =~ ^[A-Za-z0-9-]+$ ]] || { usage >&2; exit 2; }
+    L=$(last_end_line "$2"); [ -n "$L" ] || exit 1; echo "$L"; exit 0;;
+  --run)
+    NAME="$2"; SPEC="$3"; TRY="${4:-1}"
+    mkdir -p "$LOGDIR" "$STATE"
+    MODEL="${DISPATCH_MODEL:-}"; CLAUDE="${DISPATCH_CLAUDE:-claude}"
+    DISPATCH_WORKDIR="${DISPATCH_WORKDIR:-$PWD}"
+    LOG="$LOGDIR/$(date +%F)-$NAME.log"
+    SID=""; T0=""; RESUMES=0; LEDGER=""
+    cost() {   # this claude start's cost into the log; once per sid
+      [ -n "$SID" ] || return 0
+      [ -x "$RUN_COST" ] && "$RUN_COST" "$SID" --unit "dispatch-$NAME" --name "$NAME" --attempt "$TRY.$RESUMES" \
+        --rc "${RC:-}" --start "$T0" >> "$LOG" 2>&1
+      SID=""
+    }
+    # safety net: a path that forgot its marker gets one from the exit code (>128 = signal, else failed)
+    trap 'RC_=$?; cost; if [ "$RC_" -gt 128 ]; then end killed "$RC_"; else end failed "$RC_"; fi' EXIT
+    trap 'exit 143' TERM
+    cd "$DISPATCH_WORKDIR" || { log "can't cd to $DISPATCH_WORKDIR"; exit 2; }
+    MARK="$STATE/$NAME.starts"
+    STARTS=$(( $(cat "$MARK" 2>/dev/null || echo 0) + 1 ))
+    [ -n "${RESTART_COUNT:-}" ] && STARTS=$(( RESTART_COUNT + 1 ))
+    echo "$STARTS" > "$MARK"
+    AGAIN=""; [ "$STARTS" -gt 1 ] && AGAIN=", start $STARTS (previous start was killed)"
+    log "start $NAME (try $TRY, model ${MODEL:-default}) spec=$SPEC$AGAIN"
+    LEDGER=$(grep -o 'Ledger: `[^`]*`' "$SPEC" | head -1 | sed 's/^Ledger: `//; s/`$//')
+    case "$LEDGER" in "~/"*) LEDGER="$HOME/${LEDGER#\~/}";; esac
+    [ -n "$LEDGER" ] && [ "${LEDGER#/}" = "$LEDGER" ] && LEDGER="$DISPATCH_WORKDIR/$LEDGER"
+    note() {   # one line in the ledger; never starts with DONE/STOPPED, so it can't fake an ending
+      [ -n "$LEDGER" ] && [ -d "$(dirname "$LEDGER")" ] && echo "- $(date +%H:%M) [dispatch] $1" >> "$LEDGER"; return 0
+    }
+    if [ -n "${DISPATCH_AFTER:-}" ]; then   # --after: wait until every prerequisite is done or stopped
+      IFS=, read -ra PRE_NAMES <<< "$DISPATCH_AFTER"
+      A_MAX=$(( ${DISPATCH_AFTER_MAX_H:-24} * 3600 )); A0=$(date +%s)
+      log "waiting for $DISPATCH_AFTER to finish before starting"; note "waiting for $DISPATCH_AFTER to finish (--after)"
+      while :; do
+        WAITING=""; BAD=""
+        for p in "${PRE_NAMES[@]}"; do
+          if alive "$p"; then WAITING+=" $p"; continue; fi
+          E=$(last_end "$p"); case "$E" in done|stopped) ;; *) BAD+=" $p (${E:-no end marker})";; esac
+        done
+        [ -z "$BAD" ] && [ -n "$WAITING" ] && [ $(( $(date +%s) - A0 )) -ge "$A_MAX" ] \
+          && BAD="$WAITING (still running after ${DISPATCH_AFTER_MAX_H:-24} h)"
+        if [ -n "$BAD" ]; then
+          log "prerequisite not done:$BAD; not starting. $(by_hand)"; note "prerequisite not done:$BAD; not started"
+          rm -f "$MARK"; end prereq-failed 0; exit 0
+        fi
+        [ -z "$WAITING" ] && break
+        sleep "${DISPATCH_AFTER_POLL:-60}"
+      done
+      log "$DISPATCH_AFTER all finished, starting"; note "$DISPATCH_AFTER all finished, starting"
+      unset DISPATCH_AFTER   # retries scheduled from here on must not wait again
+    fi
+    for ((w = 0; ; w++)); do
+      AVAIL=$(mem_avail)
+      [ "${AVAIL:-0}" -ge "$MEM_MIN_MB" ] && break
+      if [ "$w" -ge "$MEM_WAITS" ]; then
+        log "still low on memory (available ${AVAIL:-?} MB < $MEM_MIN_MB) after $w waits; giving up rc=75. $(by_hand)"
+        rm -f "$MARK"; end low-memory 75; exit 75
+      fi
+      log "low on memory (available ${AVAIL:-?} MB < $MEM_MIN_MB), checking again in 5 minutes"
+      sleep "$MEM_WAIT_S"
+    done
+    QUOTA=on; [ "${DISPATCH_QUOTA:-on}" = off ] && QUOTA=off
+    HOLDS="$STATE/$NAME.holds"; PAUSED="$STATE/$NAME.paused"; rm -f "$PAUSED"
+    if [ "$QUOTA" = on ]; then
+      source "$LIB/quota-gate.sh"
+      SM=$(eff "$START_MAX"); QUOTA_GATE_MAX=$SM quota_gate "dispatch-$NAME"; G=$?
+      [ "$G" -eq 2 ] && log "start gate can't read the quota (reading ${AGE} h old, refresh didn't land); starting anyway"
+      if [ "$G" -eq 1 ]; then
+        H=$(cat "$HOLDS" 2>/dev/null || echo 0)
+        if [ "$H" -lt "$MAX_HOLDS" ]; then
+          echo $((H+1)) > "$HOLDS"; WHEN=$(reset_plus3 "$RESET")
+          if schedule_run "$WHEN" "hold$((H+1))"; then
+            log "5-hour window at ${U}% ≥ ${SM}%, leaving the rest for interactive use; not starting, scheduled $WHEN (hold $((H+1)))"
+          else
+            log "5-hour window at ${U}% ≥ ${SM}%, not starting, and scheduling failed. $(by_hand)"
+          fi
+          rm -f "$MARK"; end held 0; exit 0
+        fi
+        log "start gate held $MAX_HOLDS times already; starting anyway (the in-run gate still applies)"
+      fi
+    fi
+    source "$LIB/ledger-done.sh"
+    spec_done() { [ -z "$LEDGER" ] && return 0; ledger_done "$LEDGER"; }
+    PRE="(Rules for a dispatched run: you are inside \`claude -p\`. When your turn ends the process exits and every background job dies with it. Wait for things in the foreground (an until-loop, each wait ≤ 4 minutes); never move work into the background and end your turn."
+    [ -n "$LEDGER" ] && PRE+=" Finish only after the last line of the ledger ($LEDGER) is \`- HH:MM DONE\` or \`- HH:MM STOPPED: <reason>\`. Take each HH:MM from \`date +%H:%M\` when you write the line; don't estimate it."
+    PRE+=")"
+    RESUME_NOTE="(The previous run exited before writing its ending to the ledger — most likely it moved work into the background and ended its turn. Read the ledger and continue from the step where it stopped; if a background batch died with the process, redo that step.)"
+    MAX_RESUMES="${DISPATCH_MAX_RESUMES:-2}"
+    MODEL_ARGS=(); [ -n "$MODEL" ] && MODEL_ARGS=(--model "$MODEL")
+    read -ra PERM <<< "${DISPATCH_PERMISSION_FLAGS-$PERM_DEFAULT}"
+    while :; do
+      PROMPT="$PRE"$'\n\n'"$(cat "$SPEC")"
+      [ "$RESUMES" -gt 0 ] && PROMPT="$RESUME_NOTE"$'\n\n'"$PROMPT"
+      OUT=$(mktemp); SID=$(new_sid); T0=$(date +%s)
+      log "try $TRY (resume $RESUMES) sid=$SID"
+      # 0 = in -p mode, never stop waiting for background tasks and subagents (the default gives up after 600 s)
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
+        "$CLAUDE" -p "$PROMPT" "${MODEL_ARGS[@]}" "${PERM[@]}" --session-id "$SID" > "$OUT" 2>&1 &
+      CPID=$!
+      WPID=""
+      if [ "$QUOTA" = on ]; then
+        (   # in-run gate: sleep in the background and wait on it, so TERM kills the sleep at once, no orphan
+          SP=""; N2=0; trap '[ -n "$SP" ] && kill "$SP" 2>/dev/null; exit 0' TERM; trap - EXIT
+          while kill -0 "$CPID" 2>/dev/null; do
+            sleep "$POLL" & SP=$!; wait "$SP"; SP=""
+            kill -0 "$CPID" 2>/dev/null || break
+            PA=$(eff "$PAUSE_AT")
+            QUOTA_REFRESH_MIN=$(( POLL / 60 > 1 ? POLL / 60 - 1 : 0 )) QUOTA_GATE_MAX=$PA quota_gate "dispatch-$NAME-inrun"; QG=$?
+            if [ "$QG" -eq 1 ]; then
+              echo "$U|$(reset_plus3 "$RESET")|$PA" > "$PAUSED"
+              kill -TERM "$CPID" 2>/dev/null; break
+            fi
+            if [ "$QG" -eq 2 ]; then N2=$((N2 + 1)); else N2=0; fi
+            if [ "$N2" -eq 3 ]; then
+              log "in-run gate couldn't read the quota 3 times in a row (reading ${AGE} h old); not pausing"
+              notify "dispatch $NAME: the in-run quota gate can't read usage (3 misses, reading ${AGE} h old); running without it. Readings: $QUOTA_READINGS_FILE"
+            fi
+          done
+        ) &
+        WPID=$!
+      fi
+      wait "$CPID"; RC=$?
+      [ -n "$WPID" ] && { kill -TERM "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; }
+      cat "$OUT" >> "$LOG"; cost
+      [ -f "$PAUSED" ] && break
+      [ "$RC" -eq 0 ] && ! spec_done && [ "$RESUMES" -lt "$MAX_RESUMES" ] || break
+      RESUMES=$((RESUMES + 1))
+      log "exit code 0 but the ledger has no ending; resuming in place (resume $RESUMES)"
+      rm -f "$OUT"
+    done
+    if [ -f "$PAUSED" ]; then
+      IFS='|' read -r PU WHEN PA < "$PAUSED"; rm -f "$PAUSED"
+      if schedule_run "$WHEN" "pause$(date +%H%M%S)"; then
+        log "paused mid-run: 5-hour window at ${PU}% ≥ ${PA}%, leaving the rest for interactive use (not a failure); resume scheduled $WHEN"
+      else
+        log "paused mid-run (5-hour window at ${PU}%), and scheduling the resume failed. $(by_hand)"
+      fi
+      rm -f "$OUT" "$MARK"; end paused 0; exit 0
+    fi
+    rm -f "$HOLDS"
+    if [ "$RC" -ne 0 ] && grep -qiE "$LIMIT_RE" "$OUT" && [ "$TRY" -lt 3 ]; then
+      WHEN=$(bash "$LIB/quota-reset-when.sh" "$OUT")
+      if schedule_run "$WHEN" "retry$TRY" $((TRY+1)); then
+        log "hit the usage limit; try $((TRY+1)) scheduled $WHEN"
+      else
+        log "hit the usage limit, and scheduling the retry failed. $(by_hand)"
+      fi
+      RC=0; END=rate-limited   # a retry is scheduled; don't let systemd restart this as a failure too
+    elif [ "$RC" -gt 128 ]; then
+      if [ "$STARTS" -ge 3 ]; then
+        log "claude was killed by a signal rc=$RC; that's start $STARTS, systemd won't restart it within 3 h. $(by_hand)"
+      else
+        log "claude was killed by a signal rc=$RC; systemd restarts it in 2 minutes"
+      fi
+      rm -f "$OUT"; exit "$RC"   # keep $MARK so the restart knows it follows a kill; the EXIT trap writes "killed"
+    elif [ "$RC" -eq 0 ] && ! spec_done; then
+      log "resumed $MAX_RESUMES times and the ledger still has no ending; giving up. Read the ledger $LEDGER rc=0"
+      END=incomplete
+    else
+      log "finished rc=$RC"
+      if [ "$RC" -ne 0 ]; then END=failed
+      elif [ -n "$LEDGER" ] && ledger_stopped "$LEDGER"; then END=stopped
+      else END=done; fi
+    fi
+    case "$END" in done|stopped) wrapup "$END";; esac
+    rm -f "$OUT" "$MARK"; end "$END" "$RC"; exit "$RC";;
+  ""|-h|--help) usage; exit 0;;
+esac
+
+DRY=""; AFTER=""
+[ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
+if [ "${1:-}" = "--after" ]; then
+  [[ "${2:-}" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || { echo "--after takes a name, or several separated by commas" >&2; exit 2; }
+  AFTER="$2"; shift 2
+fi
+NAME="${1:-}"; SPEC="$(readlink -f "${2:-}")"
+[[ "$NAME" =~ ^[A-Za-z0-9-]+$ ]] || { echo "name: letters, digits and dashes only" >&2; exit 2; }
+[ -f "$SPEC" ] || { echo "spec file not found: ${2:-}" >&2; exit 2; }
+UNIT="dispatch-$NAME"
+if alive "$NAME"; then
+  echo "$UNIT is still running or has a retry/pause/hold scheduled (log $LOGDIR/$(date +%F)-$NAME.log; systemctl --user list-units '$UNIT*')" >&2
+  exit 1
+fi
+# resolve everything the unit needs now, in this shell, and hand it over explicitly
+DISPATCH_WORKDIR="$(cd "${DISPATCH_WORKDIR:-.}" && pwd)" || { echo "DISPATCH_WORKDIR not found: ${DISPATCH_WORKDIR:-}" >&2; exit 2; }
+DISPATCH_CLAUDE="${DISPATCH_CLAUDE:-$(command -v claude || true)}"
+[ -n "$DISPATCH_CLAUDE" ] || { echo "claude not found on PATH; set DISPATCH_CLAUDE" >&2; exit 2; }
+if [ -n "${DISPATCH_ENV_FILE:-}" ]; then
+  [ -f "$DISPATCH_ENV_FILE" ] || { echo "DISPATCH_ENV_FILE not found: $DISPATCH_ENV_FILE" >&2; exit 2; }
+  DISPATCH_ENV_FILE="$(readlink -f "$DISPATCH_ENV_FILE")"; export DISPATCH_ENV_FILE
+fi
+export DISPATCH_WORKDIR DISPATCH_CLAUDE DISPATCH_LOGDIR="$(realpath -m "$LOGDIR")" DISPATCH_STATE="$(realpath -m "$STATE")"
+unset DISPATCH_AFTER; [ -n "$AFTER" ] && export DISPATCH_AFTER="$AFTER"
+unit_props; forward_env
+CMD=(systemd-run --user --quiet --unit="$UNIT" --collect "${UNIT_PROPS[@]}" "${FWD[@]}" "$SELF" --run "$NAME" "$SPEC" 1)
+if [ -n "$DRY" ]; then printf '%q ' "${CMD[@]}"; echo; exit 0; fi
+if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = no ]; then
+  echo "note: lingering is off for $(id -un), so the run stops when your last login session ends (loginctl enable-linger)" >&2
+fi
+rm -f "$STATE/$NAME.starts"   # a new dispatch counts from start 1, whatever an older killed run left behind
+"${CMD[@]}" >/dev/null \
+  && echo "dispatched: $UNIT · log $LOGDIR/$(date +%F)-$NAME.log · status: systemctl --user status $UNIT"

@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""run-cost — what one `claude -p` session used: tokens per model, and their cost at list prices.
+
+  run-cost <session-id> [--unit NAME] [--name NAME] [--attempt N] [--rc RC] [--start EPOCH]
+
+Finds <projects>/*/<session-id>.jsonl plus every *.jsonl under <projects>/*/<session-id>/ (subagent and workflow
+transcripts; leave them out and a run that delegates looks much cheaper than it was). Each assistant message is
+counted once, from its last row: one reply is often written as several rows whose usage grows row by row.
+Sums input / output / cache read / cache write (1h and 5m apart) per model.
+
+Prints one human-readable line to stdout (claude-dispatch appends it to the run's log) and appends one JSON row
+to the ledger. A model with no price is reported as "unpriced", never counted as $0; a session id with no
+transcript is reported as missing.
+On a subscription this isn't money you paid; it's a list-price yardstick for comparing runs.
+Paths: RUN_COST_PROJECTS (default ${CLAUDE_CONFIG_DIR:-~/.claude}/projects), RUN_COST_LEDGER (default
+${XDG_STATE_HOME:-~/.local/state}/claude-dispatch/run-cost.jsonl). RUN_COST_PRICES = a JSON file
+{"model": [input, output, cache_read, cache_write_5m, cache_write_1h], ...} that overrides or extends PRICES.
+Always exits 0: it runs at the end of a job and must never turn a finished job into a failed one.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+_CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+PROJECTS = os.environ.get("RUN_COST_PROJECTS") or os.path.join(_CONFIG, "projects")
+LEDGER = os.environ.get("RUN_COST_LEDGER") or os.path.join(_STATE, "claude-dispatch", "run-cost.jsonl")
+# USD per million tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
+# List prices as of 2026-10; check them against the current price page and use RUN_COST_PRICES to correct them.
+PRICES = {"opus-5-5": (4, 20, .2, 5, 8), "opus-5": (5, 25, .5, 6.25, 10), "sonnet-5": (2, 10, .2, 2.5, 4),
+          "fable-5-1": (10, 50, .25, 12.5, 20), "haiku-4-5": (1, 5, .1, 1.25, 2)}
+
+
+def load_prices():
+    p = dict(PRICES)
+    path = os.environ.get("RUN_COST_PRICES")
+    if path:
+        with open(path, encoding="utf-8") as fh:
+            p.update({short(k): tuple(v) for k, v in json.load(fh).items()})
+    return p
+
+
+def short(model):
+    """claude-haiku-4-5-20251001 → haiku-4-5: no vendor prefix, no date suffix."""
+    return re.sub(r"-\d{8}$", "", (model or "").replace("claude-", "", 1))
+
+
+def price(model, prices):
+    return prices.get(short(model))   # exact match only: opus-5 must not price opus-5-5, nor sonnet-5 price sonnet-5-5
+
+
+def files_for(sid):
+    mains = glob.glob(os.path.join(PROJECTS, "*", f"{sid}.jsonl"))
+    subs = []
+    for m in mains:
+        subs += glob.glob(os.path.join(m[:-6], "**", "*.jsonl"), recursive=True)
+    return mains, subs
+
+
+def tally(paths, prices):
+    last = {}   # message.id → its last row: earlier rows of a split reply carry partial usage
+    for p in paths:
+        try:
+            fh = open(p, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                m = d.get("message") or {}
+                if m.get("usage") and m.get("id"):
+                    last[m["id"]] = m
+    by = {}
+    for m in last.values():
+        us = m["usage"]
+        model = m.get("model") or "?"
+        if model == "<synthetic>":
+            continue
+        cc = us.get("cache_creation") or {}
+        w1 = cc.get("ephemeral_1h_input_tokens", 0) or 0
+        w5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
+        if w1 + w5 == 0:
+            w5 = us.get("cache_creation_input_tokens", 0) or 0
+        t = by.setdefault(model, {"in": 0, "out": 0, "cr": 0, "w5": 0, "w1": 0, "calls": 0})
+        t["in"] += us.get("input_tokens", 0) or 0
+        t["out"] += us.get("output_tokens", 0) or 0
+        t["cr"] += us.get("cache_read_input_tokens", 0) or 0
+        t["w5"] += w5
+        t["w1"] += w1
+        t["calls"] += 1
+    for model, t in by.items():
+        p = price(model, prices)
+        t["usd"] = None if p is None else round((t["in"] * p[0] + t["out"] * p[1] + t["cr"] * p[2]
+                                                  + t["w5"] * p[3] + t["w1"] * p[4]) / 1e6, 4)
+    return by
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="tokens and list-price cost of one claude -p session")
+    ap.add_argument("sid")
+    ap.add_argument("--unit", default="")
+    ap.add_argument("--name", default="")
+    ap.add_argument("--attempt", default="")
+    ap.add_argument("--rc", default="")
+    ap.add_argument("--start", default="")
+    a = ap.parse_args(argv)
+    mains, subs = files_for(a.sid)
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "unit": a.unit, "name": a.name, "sid": a.sid,
+           "attempt": a.attempt, "rc": a.rc, "start": a.start, "end": int(time.time())}
+    if not mains:
+        row["missing"] = True
+        line = f"[cost] sid={a.sid} missing (session transcript not found)"
+    else:
+        by = tally(mains + subs, load_prices())
+        total = round(sum(t["usd"] for t in by.values() if t["usd"] is not None), 4)
+        row.update(models=by, usd=total, subagent_files=len(subs), unpriced=[m for m, t in by.items() if t["usd"] is None])
+        parts = []
+        for m, t in sorted(by.items()):
+            cost = f"${t['usd']:.2f}" if t["usd"] is not None else "unpriced"
+            parts.append(f"{short(m)} {t['calls']} calls in={t['in']} out={t['out']} cr={t['cr']} cw={t['w5'] + t['w1']} {cost}")
+        line = (f"[cost] sid={a.sid} list-price total ${total:.2f} (incl. {len(subs)} subagent files): " + "; ".join(parts)
+                + (" (unpriced models not included in the total)" if row["unpriced"] else ""))
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+        with open(LEDGER, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[cost] couldn't write the ledger: {e}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # runs at the end of a job: always 0
+        print(f"[cost] couldn't compute: {type(e).__name__}: {e}")
+    sys.exit(0)
